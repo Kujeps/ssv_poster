@@ -121,3 +121,21 @@ def add_log(chat_id, title, unit, status, error=""):
     conn.execute("INSERT INTO log (ts,chat_id,chat_title,unit,status,error) VALUES (?,?,?,?,?,?)",
                  (time.time(), chat_id, title, unit, status, error))
     conn.commit()
+
+
+def list_units(offset, limit):
+    return conn.execute(
+        f"SELECT {UNIT} u, MIN(message_id) first, COUNT(*) n FROM posts WHERE active=1 "
+        f"GROUP BY u ORDER BY first DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+
+
+def delete_unit(unit):
+    conn.execute(f"DELETE FROM posts WHERE {UNIT}=?", (unit,))
+    conn.execute("DELETE FROM sent WHERE unit=?", (unit,))
+    conn.commit()
+
+
+def clear_posts():
+    conn.execute("DELETE FROM posts")
+    conn.execute("DELETE FROM sent")
+    conn.commit()

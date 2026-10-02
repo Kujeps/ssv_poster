@@ -12,7 +12,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BufferedInputFile, CallbackQuery, ChatMemberUpdated,
-                           InlineKeyboardButton as Btn, InlineKeyboardMarkup, Message)
+                           InlineKeyboardButton as Btn, LinkPreviewOptions, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -57,6 +57,7 @@ def main_kb():
     paused = db.get_setting("paused") == "1"
     kb = InlineKeyboardBuilder()
     kb.button(text=f"💬 Чаты ({len(db.list_chats())})", callback_data="chats")
+    kb.button(text=f"🗂 Посты ({db.units_count()})", callback_data="posts:0")
     kb.button(text=f"⏱ Интервал по умолчанию: {fmt(db.default_interval())}", callback_data="ivpick:0")
     kb.button(text="▶️ Возобновить всё" if paused else "⏸ Пауза всего", callback_data="pause")
     kb.button(text="📊 Excel-статистика", callback_data="xlsx")
@@ -112,9 +113,37 @@ def interval_screen(chat_id):
     return f"Интервал для: {where}", kb.as_markup()
 
 
+PAGE = 8
+
+
+def posts_screen(page):
+    total = db.units_count()
+    page = max(0, min(page, (max(total, 1) - 1) // PAGE))
+    units = db.list_units(page * PAGE, PAGE)
+    lines = [f"Посты в памяти бота: {total}. Нажмите 🗑, чтобы убрать пост из рассылки.", ""]
+    kb = InlineKeyboardBuilder()
+    for i, u in enumerate(units, 1):
+        album = f" (альбом, {u['n']} шт.)" if u["n"] > 1 else ""
+        lines.append(f"{i}. https://t.me/{stats.CHANNEL}/{u['first']}{album}")
+        kb.button(text=f"🗑 {i}", callback_data=f"pd:{u['u']}:{page}")
+    kb.adjust(4)
+    nav = []
+    if page > 0:
+        nav.append(Btn(text="«", callback_data=f"posts:{page - 1}"))
+    if (page + 1) * PAGE < total:
+        nav.append(Btn(text="»", callback_data=f"posts:{page + 1}"))
+    if nav:
+        kb.row(*nav)
+    if total:
+        kb.row(Btn(text="🧹 Удалить все", callback_data="pclear"))
+    kb.row(Btn(text="« Назад", callback_data="main"))
+    return "\n".join(lines), kb.as_markup()
+
+
 async def show(cb: CallbackQuery, text, kb):
     try:
-        await cb.message.edit_text(text, reply_markup=kb)
+        await cb.message.edit_text(text, reply_markup=kb,
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True))
     except TelegramBadRequest:
         pass
 
@@ -213,6 +242,37 @@ async def got_interval(m: Message, state: FSMContext):
     await state.clear()
     await apply_interval(cid, minutes)
     await m.answer(f"Интервал: {fmt(minutes)}", reply_markup=main_kb())
+
+
+@router.callback_query(F.data.startswith("posts:"))
+async def cb_posts(cb: CallbackQuery):
+    await show(cb, *posts_screen(int(cb.data.split(":")[1])))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("pd:"))
+async def cb_post_delete(cb: CallbackQuery):
+    _, unit, page = cb.data.split(":")
+    db.delete_unit(unit)
+    await show(cb, *posts_screen(int(page)))
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data == "pclear")
+async def cb_pclear(cb: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Да, удалить все", callback_data="pclear_yes")
+    kb.button(text="Отмена", callback_data="posts:0")
+    kb.adjust(1)
+    await show(cb, "Удалить все посты из памяти бота? Новые посты канала добавятся заново.", kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "pclear_yes")
+async def cb_pclear_yes(cb: CallbackQuery):
+    db.clear_posts()
+    await show(cb, *posts_screen(0))
+    await cb.answer("Очищено")
 
 
 @router.callback_query(F.data == "xlsx")
