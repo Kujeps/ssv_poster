@@ -139,3 +139,9 @@ def clear_posts():
     conn.execute("DELETE FROM posts")
     conn.execute("DELETE FROM sent")
     conn.commit()
+
+
+def delete_chat(chat_id):
+    conn.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
+    conn.execute("DELETE FROM sent WHERE chat_id=?", (chat_id,))
+    conn.commit()

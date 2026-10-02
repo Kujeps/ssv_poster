@@ -95,6 +95,7 @@ def chat_screen(chat_id):
     kb.button(text="⏸ Выключить" if c["enabled"] else "▶️ Включить", callback_data=f"tg:{chat_id}")
     kb.button(text="⏱ Интервал", callback_data=f"ivpick:{chat_id}")
     kb.button(text="🚀 Отправить сейчас", callback_data=f"now:{chat_id}")
+    kb.button(text="🗑 Удалить чат", callback_data=f"cdel:{chat_id}")
     kb.button(text="« Назад", callback_data="chats")
     kb.adjust(1)
     return text, kb.as_markup()
@@ -173,6 +174,33 @@ async def cb_chats(cb: CallbackQuery):
 async def cb_chat(cb: CallbackQuery):
     await show(cb, *chat_screen(int(cb.data.split(":")[1])))
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("cdel:"))
+async def cb_chat_delete(cb: CallbackQuery):
+    cid = int(cb.data.split(":")[1])
+    c = db.get_chat(cid)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Удалить из списка", callback_data=f"cdy:{cid}:0")
+    kb.button(text="Удалить и выйти из чата", callback_data=f"cdy:{cid}:1")
+    kb.button(text="Отмена", callback_data=f"chat:{cid}")
+    kb.adjust(1)
+    await show(cb, f"Убрать «{c['title']}» из списка? Статистика в Excel сохранится.", kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("cdy:"))
+async def cb_chat_delete_yes(cb: CallbackQuery, bot: Bot):
+    _, cid, leave = cb.data.split(":")
+    cid = int(cid)
+    if leave == "1":
+        try:
+            await bot.leave_chat(cid)
+        except Exception as ex:  # noqa: BLE001
+            await cb.message.answer(f"Не удалось выйти из чата: {ex}")
+    db.delete_chat(cid)
+    await show(cb, *chats_screen())
+    await cb.answer("Удалено")
 
 
 @router.callback_query(F.data == "pause")
