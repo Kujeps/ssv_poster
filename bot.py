@@ -33,6 +33,42 @@ PRESETS = [15, 30, 60, 120, 240, 360, 720, 1440]
 
 class Form(StatesGroup):
     interval = State()
+    quiet = State()
+
+
+def hm(m):
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def quiet_range():
+    return int(db.get_setting("quiet_start", 23 * 60)), int(db.get_setting("quiet_end", 8 * 60))
+
+
+def quiet_label():
+    if db.get_setting("quiet_on") != "1":
+        return "выкл"
+    a, b = quiet_range()
+    return f"{hm(a)}–{hm(b)}"
+
+
+def is_quiet():
+    if db.get_setting("quiet_on") != "1":
+        return False
+    a, b = quiet_range()
+    now = datetime.now(stats.TZ)
+    m = now.hour * 60 + now.minute
+    return a <= m < b if a < b else (m >= a or m < b)
+
+
+def parse_quiet(text):
+    m = re.fullmatch(r"\s*(\d{1,2})(?:[:.](\d{2}))?\s*[-–—]\s*(\d{1,2})(?:[:.](\d{2}))?\s*", text)
+    if not m:
+        return None
+    a = int(m[1]) * 60 + int(m[2] or 0)
+    b = int(m[3]) * 60 + int(m[4] or 0)
+    if a >= 1440 or b >= 1440 or a == b or int(m[2] or 0) > 59 or int(m[4] or 0) > 59:
+        return None
+    return a, b
 
 
 def fmt(m):
@@ -59,6 +95,7 @@ def main_kb():
     kb.button(text=f"💬 Чаты ({len(db.list_chats())})", callback_data="chats")
     kb.button(text=f"🗂 Посты ({db.units_count()})", callback_data="posts:0")
     kb.button(text=f"⏱ Интервал по умолчанию: {fmt(db.default_interval())}", callback_data="ivpick:0")
+    kb.button(text=f"🌙 Тихие часы: {quiet_label()}", callback_data="quiet")
     kb.button(text="▶️ Возобновить всё" if paused else "⏸ Пауза всего", callback_data="pause")
     kb.button(text="📊 Excel-статистика", callback_data="xlsx")
     kb.adjust(1)
@@ -201,6 +238,48 @@ async def cb_chat_delete_yes(cb: CallbackQuery, bot: Bot):
     db.delete_chat(cid)
     await show(cb, *chats_screen())
     await cb.answer("Удалено")
+
+
+@router.callback_query(F.data == "quiet")
+async def cb_quiet(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    on = db.get_setting("quiet_on") == "1"
+    a, b = quiet_range()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Выключить" if on else "Включить", callback_data="quiet_tg")
+    kb.button(text="✏️ Задать часы", callback_data="quiet_set")
+    kb.button(text="« Назад", callback_data="main")
+    kb.adjust(1)
+    await show(cb, f"Тихие часы: {'включены' if on else 'выключены'}\n"
+                   f"Не постить с {hm(a)} до {hm(b)} ({stats.TZ.key}).\n"
+                   "После окончания тихих часов каждый чат получит один пост.", kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "quiet_tg")
+async def cb_quiet_tg(cb: CallbackQuery, state: FSMContext):
+    db.set_setting("quiet_on", "0" if db.get_setting("quiet_on") == "1" else "1")
+    await cb_quiet(cb, state)
+
+
+@router.callback_query(F.data == "quiet_set")
+async def cb_quiet_set(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.quiet)
+    await cb.message.answer("Введите часы в формате 23:00-08:00 (или 23-8).")
+    await cb.answer()
+
+
+@router.message(StateFilter(Form.quiet))
+async def got_quiet(m: Message, state: FSMContext):
+    r = parse_quiet(m.text or "")
+    if not r:
+        await m.answer("Не понял. Пример: 23:00-08:00")
+        return
+    await state.clear()
+    db.set_setting("quiet_start", r[0])
+    db.set_setting("quiet_end", r[1])
+    db.set_setting("quiet_on", "1")
+    await m.answer(f"Тихие часы включены: {hm(r[0])}–{hm(r[1])}", reply_markup=main_kb())
 
 
 @router.callback_query(F.data == "pause")
@@ -376,7 +455,7 @@ async def post_to_chat(bot: Bot, chat):
 async def scheduler(bot: Bot):
     while True:
         await asyncio.sleep(10)
-        if db.get_setting("paused") == "1":
+        if db.get_setting("paused") == "1" or is_quiet():
             continue
         for chat in db.due_chats():
             await post_to_chat(bot, chat)
