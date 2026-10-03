@@ -111,16 +111,23 @@ def main_text():
             "Порядок: случайный, без повторов до конца круга.")
 
 
+def chat_ref(c):
+    return f"{c['title']} — {c['link']}" if c["link"] else f"{c['title']} (ссылки нет)"
+
+
 def chats_screen():
     kb = InlineKeyboardBuilder()
-    for c in db.list_chats():
+    chats = db.list_chats()
+    lines = []
+    for i, c in enumerate(chats, 1):
         mark = "✅" if c["enabled"] else "⏸"
         own = "" if c["interval"] else " (общ.)"
-        kb.button(text=f"{mark} {c['title']} · {fmt(db.chat_interval(c))}{own}",
+        lines.append(f"{i}. {chat_ref(c)}")
+        kb.button(text=f"{mark} {i}. {c['title']} · {fmt(db.chat_interval(c))}{own}",
                   callback_data=f"chat:{c['chat_id']}")
     kb.button(text="« Назад", callback_data="main")
     kb.adjust(1)
-    text = "Чаты, где бот добавлен." if db.list_chats() else (
+    text = ("Чаты, где бот добавлен:\n\n" + "\n".join(lines)) if chats else (
         "Чатов пока нет. Добавьте бота в группу и назначьте администратором.")
     return text, kb.as_markup()
 
@@ -128,7 +135,7 @@ def chats_screen():
 def chat_screen(chat_id):
     c = db.get_chat(chat_id)
     nxt = datetime.fromtimestamp(c["next_at"], stats.TZ).strftime("%d.%m %H:%M")
-    text = (f"{c['title']}\nСтатус: {'включён' if c['enabled'] else 'выключен'}\n"
+    text = (f"{chat_ref(c)}\nСтатус: {'включён' if c['enabled'] else 'выключен'}\n"
             f"Интервал: {fmt(db.chat_interval(c))}{'' if c['interval'] else ' (общий)'}\n"
             f"Следующий пост: {nxt}")
     kb = InlineKeyboardBuilder()
@@ -179,6 +186,14 @@ def posts_screen(page):
         kb.row(Btn(text="🧹 Удалить все", callback_data="pclear"))
     kb.row(Btn(text="« Назад", callback_data="main"))
     return "\n".join(lines), kb.as_markup()
+
+
+NOPREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+async def refresh_link(bot: Bot, chat_id):
+    chat = await bot.get_chat(chat_id)
+    db.set_link(chat_id, f"https://t.me/{chat.username}" if chat.username else chat.invite_link)
 
 
 async def show(cb: CallbackQuery, text, kb):
@@ -326,7 +341,7 @@ async def cb_check(cb: CallbackQuery, bot: Bot):
         text += "\n" + "\n".join(f"– {t}" for t in removed)
     if unknown:
         text += f"\nНе удалось проверить: {unknown} (временная ошибка, чаты оставлены)."
-    await cb.message.answer(text, reply_markup=main_kb())
+    await cb.message.answer(text, reply_markup=main_kb(), link_preview_options=NOPREVIEW)
 
 
 @router.callback_query(F.data == "pause")
@@ -451,11 +466,16 @@ async def on_member(e: ChatMemberUpdated, bot: Bot):
     status = e.new_chat_member.status
     if status in ("administrator", "member"):
         db.upsert_chat(e.chat.id, e.chat.title, e.chat.type)
+        try:
+            await refresh_link(bot, e.chat.id)
+        except Exception:  # noqa: BLE001
+            pass
         note = "администратором" if status == "administrator" else "участником (без прав админа)"
         await bot.send_message(OWNER, f"Бот добавлен в «{e.chat.title}» {note}.")
     elif status in ("left", "kicked"):
         db.delete_chat(e.chat.id)
-        await bot.send_message(OWNER, f"Бот удалён из «{e.chat.title}», чат убран из списка.")
+        await bot.send_message(OWNER, f"Бот удалён из «{e.chat.title}», чат убран из списка.",
+                               link_preview_options=NOPREVIEW)
 
 
 # ---------- scheduler ----------
@@ -490,7 +510,8 @@ async def post_to_chat(bot: Bot, chat):
     except TelegramForbiddenError as ex:
         db.delete_chat(cid)
         db.add_log(cid, title, "", "forbidden", str(ex))
-        await bot.send_message(OWNER, f"Нет доступа к «{title}», чат убран из списка: {ex}")
+        await bot.send_message(OWNER, f"Нет доступа к «{title}», чат убран из списка:\n"
+                                      f"{chat['link'] or ''}\n{ex}", link_preview_options=NOPREVIEW)
     except Exception as ex:  # noqa: BLE001
         logging.exception("post failed")
         db.add_log(cid, title, "", "error", str(ex))
@@ -512,15 +533,16 @@ async def check_chats(bot: Bot):
             m = await bot.get_chat_member(cid, bot.id)
             if m.status in ("left", "kicked"):
                 raise TelegramForbiddenError(method=None, message="bot is not a member")
+            await refresh_link(bot, cid)
         except TelegramMigrateToChat as ex:
             db.migrate_chat(cid, ex.migrate_to_chat_id)
         except TelegramForbiddenError:
             db.delete_chat(cid)
-            removed.append(c["title"])
+            removed.append(chat_ref(c))
         except TelegramBadRequest as ex:
             if any(g in str(ex).lower() for g in GONE):
                 db.delete_chat(cid)
-                removed.append(c["title"])
+                removed.append(chat_ref(c))
             else:
                 unknown += 1
         except TelegramRetryAfter as ex:
@@ -534,10 +556,11 @@ async def check_chats(bot: Bot):
 
 async def checker(bot: Bot):
     while True:
-        await asyncio.sleep(6 * 3600)
         _, removed, _ = await check_chats(bot)
         if removed:
-            await bot.send_message(OWNER, "Недоступные чаты убраны из списка:\n" + "\n".join(removed))
+            await bot.send_message(OWNER, "Недоступные чаты убраны из списка:\n" + "\n".join(removed),
+                                   link_preview_options=NOPREVIEW)
+        await asyncio.sleep(6 * 3600)
 
 
 async def scheduler(bot: Bot):

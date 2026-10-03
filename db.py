@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS log (
     unit TEXT, status TEXT, error TEXT);
 """)
 
+try:
+    conn.execute("ALTER TABLE chats ADD COLUMN link TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass
+
 UNIT = "COALESCE(media_group_id, 'm' || message_id)"
 
 
@@ -37,6 +43,12 @@ def default_interval():
 
 def chat_interval(chat):
     return chat["interval"] or default_interval()
+
+
+def set_link(chat_id, link):
+    if link:
+        conn.execute("UPDATE chats SET link=? WHERE chat_id=?", (link, chat_id))
+        conn.commit()
 
 
 def upsert_chat(chat_id, title, ctype, active=1):
