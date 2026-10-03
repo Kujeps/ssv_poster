@@ -28,6 +28,7 @@ channel_id = None
 router = Router()
 owner_msg = router.message.filter(F.chat.type == "private", F.from_user.id == OWNER)
 owner_cb = router.callback_query.filter(F.from_user.id == OWNER)
+send_lock = asyncio.Lock()
 PRESETS = [15, 30, 60, 120, 240, 360, 720, 1440]
 
 
@@ -92,6 +93,7 @@ def parse_interval(text):
 def main_kb():
     paused = db.get_setting("paused") == "1"
     kb = InlineKeyboardBuilder()
+    kb.button(text="🚀 Отправить во все чаты", callback_data="all")
     kb.button(text=f"💬 Чаты ({len(db.list_chats())})", callback_data="chats")
     kb.button(text=f"🗂 Посты ({db.units_count()})", callback_data="posts:0")
     kb.button(text=f"⏱ Интервал по умолчанию: {fmt(db.default_interval())}", callback_data="ivpick:0")
@@ -282,6 +284,38 @@ async def got_quiet(m: Message, state: FSMContext):
     await m.answer(f"Тихие часы включены: {hm(r[0])}–{hm(r[1])}", reply_markup=main_kb())
 
 
+@router.callback_query(F.data == "all")
+async def cb_all(cb: CallbackQuery):
+    n = len([c for c in db.list_chats() if c["enabled"]])
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"Да, отправить в {n}", callback_data="all_yes")
+    kb.button(text="Отмена", callback_data="main")
+    kb.adjust(1)
+    await show(cb, f"Отправить по одному посту во все включённые чаты ({n})? "
+                   "Паузы и тихие часы игнорируются, у каждого чата свой случайный пост. "
+                   "Таймер следующего поста в чатах начнётся заново.", kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "all_yes")
+async def cb_all_yes(cb: CallbackQuery, bot: Bot):
+    chats = [c for c in db.list_chats() if c["enabled"]]
+    if not chats:
+        await cb.answer("Нет включённых чатов", show_alert=True)
+        return
+    await show(cb, f"Отправляю в {len(chats)} чатов…", None)
+    await cb.answer()
+    start = time.time()
+    async with send_lock:
+        for c in chats:
+            await post_to_chat(bot, c)
+            await asyncio.sleep(1)
+    ok, bad = db.conn.execute(
+        "SELECT COALESCE(SUM(status='ok'),0), COALESCE(SUM(status!='ok'),0) FROM log WHERE ts>=?",
+        (start,)).fetchone()
+    await cb.message.answer(f"Готово: успешно {ok}, ошибок {bad}.", reply_markup=main_kb())
+
+
 @router.callback_query(F.data == "pause")
 async def cb_pause(cb: CallbackQuery):
     db.set_setting("paused", "0" if db.get_setting("paused") == "1" else "1")
@@ -457,9 +491,10 @@ async def scheduler(bot: Bot):
         await asyncio.sleep(10)
         if db.get_setting("paused") == "1" or is_quiet():
             continue
-        for chat in db.due_chats():
-            await post_to_chat(bot, chat)
-            await asyncio.sleep(1)
+        async with send_lock:
+            for chat in db.due_chats():
+                await post_to_chat(bot, chat)
+                await asyncio.sleep(1)
 
 
 async def main():
