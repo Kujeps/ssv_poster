@@ -96,6 +96,7 @@ def main_kb():
     kb.button(text="🚀 Отправить во все чаты", callback_data="all")
     kb.button(text=f"💬 Чаты ({len(db.list_chats())})", callback_data="chats")
     kb.button(text=f"🗂 Посты ({db.units_count()})", callback_data="posts:0")
+    kb.button(text="🔍 Проверить доступность чатов", callback_data="check")
     kb.button(text=f"⏱ Интервал по умолчанию: {fmt(db.default_interval())}", callback_data="ivpick:0")
     kb.button(text=f"🌙 Тихие часы: {quiet_label()}", callback_data="quiet")
     kb.button(text="▶️ Возобновить всё" if paused else "⏸ Пауза всего", callback_data="pause")
@@ -316,6 +317,18 @@ async def cb_all_yes(cb: CallbackQuery, bot: Bot):
     await cb.message.answer(f"Готово: успешно {ok}, ошибок {bad}.", reply_markup=main_kb())
 
 
+@router.callback_query(F.data == "check")
+async def cb_check(cb: CallbackQuery, bot: Bot):
+    await cb.answer("Проверяю…")
+    total, removed, unknown = await check_chats(bot)
+    text = f"Проверено чатов: {total}. Удалено недоступных: {len(removed)}."
+    if removed:
+        text += "\n" + "\n".join(f"– {t}" for t in removed)
+    if unknown:
+        text += f"\nНе удалось проверить: {unknown} (временная ошибка, чаты оставлены)."
+    await cb.message.answer(text, reply_markup=main_kb())
+
+
 @router.callback_query(F.data == "pause")
 async def cb_pause(cb: CallbackQuery):
     db.set_setting("paused", "0" if db.get_setting("paused") == "1" else "1")
@@ -441,8 +454,8 @@ async def on_member(e: ChatMemberUpdated, bot: Bot):
         note = "администратором" if status == "administrator" else "участником (без прав админа)"
         await bot.send_message(OWNER, f"Бот добавлен в «{e.chat.title}» {note}.")
     elif status in ("left", "kicked"):
-        db.upsert_chat(e.chat.id, e.chat.title, e.chat.type, active=0)
-        await bot.send_message(OWNER, f"Бот удалён из «{e.chat.title}».")
+        db.delete_chat(e.chat.id)
+        await bot.send_message(OWNER, f"Бот удалён из «{e.chat.title}», чат убран из списка.")
 
 
 # ---------- scheduler ----------
@@ -475,15 +488,56 @@ async def post_to_chat(bot: Bot, chat):
     except TelegramMigrateToChat as ex:
         db.migrate_chat(cid, ex.migrate_to_chat_id)
     except TelegramForbiddenError as ex:
-        db.update_chat(cid, active=0)
+        db.delete_chat(cid)
         db.add_log(cid, title, "", "forbidden", str(ex))
-        await bot.send_message(OWNER, f"Нет доступа к «{title}», чат отключён: {ex}")
+        await bot.send_message(OWNER, f"Нет доступа к «{title}», чат убран из списка: {ex}")
     except Exception as ex:  # noqa: BLE001
         logging.exception("post failed")
         db.add_log(cid, title, "", "error", str(ex))
     finally:
         if db.get_chat(cid):
             db.update_chat(cid, next_at=next_at)
+
+
+GONE = ("chat not found", "kicked", "not a member", "forbidden", "deactivated")
+
+
+async def check_chats(bot: Bot):
+    """Returns (checked, removed_titles, unknown). Only definitive errors remove a chat."""
+    removed, unknown = [], 0
+    chats = db.list_chats(active_only=False)
+    for c in chats:
+        cid = c["chat_id"]
+        try:
+            m = await bot.get_chat_member(cid, bot.id)
+            if m.status in ("left", "kicked"):
+                raise TelegramForbiddenError(method=None, message="bot is not a member")
+        except TelegramMigrateToChat as ex:
+            db.migrate_chat(cid, ex.migrate_to_chat_id)
+        except TelegramForbiddenError:
+            db.delete_chat(cid)
+            removed.append(c["title"])
+        except TelegramBadRequest as ex:
+            if any(g in str(ex).lower() for g in GONE):
+                db.delete_chat(cid)
+                removed.append(c["title"])
+            else:
+                unknown += 1
+        except TelegramRetryAfter as ex:
+            await asyncio.sleep(ex.retry_after + 1)
+            unknown += 1
+        except Exception:  # noqa: BLE001 - network hiccup, keep the chat
+            unknown += 1
+        await asyncio.sleep(0.5)
+    return len(chats), removed, unknown
+
+
+async def checker(bot: Bot):
+    while True:
+        await asyncio.sleep(6 * 3600)
+        _, removed, _ = await check_chats(bot)
+        if removed:
+            await bot.send_message(OWNER, "Недоступные чаты убраны из списка:\n" + "\n".join(removed))
 
 
 async def scheduler(bot: Bot):
@@ -506,6 +560,7 @@ async def main():
     channel_id = (await bot.get_chat(CHANNEL)).id
     logging.info("channel %s -> %s", CHANNEL, channel_id)
     asyncio.create_task(scheduler(bot))
+    asyncio.create_task(checker(bot))
     await dp.start_polling(bot, allowed_updates=["message", "callback_query",
                                                  "channel_post", "my_chat_member"])
 
