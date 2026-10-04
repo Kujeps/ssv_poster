@@ -10,15 +10,27 @@ from openpyxl.utils import get_column_letter
 import db
 
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
-CHANNEL = os.getenv("CHANNEL", "").lstrip("@")
 
 
-def post_link(unit):
-    first = unit[1:] if unit.startswith("m") else None
-    if first is None:
-        ids = db.unit_ids(unit)
-        first = ids[0] if ids else None
-    return f"https://t.me/{CHANNEL}/{first}" if first else ""
+def channel_base(w):
+    ref = (w["channel_ref"] or "") if w else ""
+    if ref.startswith("@"):
+        return f"https://t.me/{ref[1:]}"
+    if w and w["channel_id"]:
+        return f"https://t.me/c/{abs(w['channel_id']) - 10 ** 12}"
+    return ""
+
+
+def post_link(w, unit):
+    if not w or not unit:
+        return ""
+    first = db.unit_first(w["id"], unit)
+    base = channel_base(w)
+    return f"{base}/{first}" if first and base else ""
+
+
+def _dt(ts):
+    return datetime.fromtimestamp(ts, TZ).replace(tzinfo=None) if ts else ""
 
 
 def _sheet(ws, header, rows):
@@ -36,42 +48,54 @@ def _sheet(ws, header, rows):
 
 
 def build_xlsx() -> bytes:
+    workers = {w["id"]: w for w in db.list_workers()}
     log = db.conn.execute("SELECT * FROM log ORDER BY ts DESC").fetchall()
-    wb = Workbook()
 
+    def bname(r):
+        w = workers.get(r["worker_id"])
+        return r["worker_name"] or (w["name"] if w else f"бот {r['worker_id']}")
+
+    wb = Workbook()
     ws = wb.active
     ws.title = "Журнал"
-    _sheet(ws, ["Дата и время", "Чат", "ID чата", "Пост", "Ссылка на пост", "Статус", "Ошибка"],
-           [[datetime.fromtimestamp(r["ts"], TZ).replace(tzinfo=None), r["chat_title"],
-             r["chat_id"], r["unit"], post_link(r["unit"]) if r["unit"] else "",
-             r["status"], r["error"]] for r in log])
+    _sheet(ws, ["Дата и время", "Бот", "Чат", "ID чата", "Пост", "Ссылка на пост", "Статус", "Ошибка"],
+           [[_dt(r["ts"]), bname(r), r["chat_title"], r["chat_id"], r["unit"],
+             post_link(workers.get(r["worker_id"]), r["unit"]), r["status"], r["error"]]
+            for r in log])
+
+    ws = wb.create_sheet("По ботам")
+    rows = db.conn.execute(
+        "SELECT worker_id, MAX(worker_name) worker_name, SUM(status='ok') ok, SUM(status!='ok') err, "
+        "COUNT(DISTINCT chat_id) chats, MAX(CASE WHEN status='ok' THEN ts END) last "
+        "FROM log GROUP BY worker_id").fetchall()
+    _sheet(ws, ["Бот", "Успешно", "Ошибки", "Чатов в журнале", "Последний пост"],
+           [[bname(r), r["ok"], r["err"], r["chats"], _dt(r["last"])] for r in rows])
 
     ws = wb.create_sheet("По чатам")
     rows = db.conn.execute(
-        "SELECT chat_id, MAX(chat_title) t, SUM(status='ok') ok, SUM(status!='ok') err, "
-        "MAX(CASE WHEN status='ok' THEN ts END) last FROM log GROUP BY chat_id").fetchall()
-    _sheet(ws, ["Чат", "ID чата", "Успешно", "Ошибки", "Последний пост"],
-           [[r["t"], r["chat_id"], r["ok"], r["err"],
-             datetime.fromtimestamp(r["last"], TZ).replace(tzinfo=None) if r["last"] else ""]
-            for r in rows])
+        "SELECT worker_id, MAX(worker_name) wn, chat_id, MAX(chat_title) t, SUM(status='ok') ok, "
+        "SUM(status!='ok') err, MAX(CASE WHEN status='ok' THEN ts END) last "
+        "FROM log GROUP BY worker_id, chat_id").fetchall()
+    _sheet(ws, ["Бот", "Чат", "ID чата", "Успешно", "Ошибки", "Последний пост"],
+           [[bname({"worker_name": r["wn"], "worker_id": r["worker_id"]}), r["t"], r["chat_id"],
+             r["ok"], r["err"], _dt(r["last"])] for r in rows])
 
     ws = wb.create_sheet("По постам")
     rows = db.conn.execute(
-        "SELECT unit, SUM(status='ok') ok, COUNT(DISTINCT CASE WHEN status='ok' THEN chat_id END) chats "
-        "FROM log WHERE unit!='' GROUP BY unit ORDER BY ok DESC").fetchall()
-    _sheet(ws, ["Пост", "Ссылка", "Отправок", "Чатов"],
-           [[r["unit"], post_link(r["unit"]), r["ok"], r["chats"]] for r in rows])
+        "SELECT worker_id, MAX(worker_name) wn, unit, SUM(status='ok') ok, "
+        "COUNT(DISTINCT CASE WHEN status='ok' THEN chat_id END) chats "
+        "FROM log WHERE unit!='' GROUP BY worker_id, unit ORDER BY ok DESC").fetchall()
+    _sheet(ws, ["Бот", "Пост", "Ссылка", "Отправок", "Чатов"],
+           [[bname({"worker_name": r["wn"], "worker_id": r["worker_id"]}), r["unit"],
+             post_link(workers.get(r["worker_id"]), r["unit"]), r["ok"], r["chats"]] for r in rows])
 
     ws = wb.create_sheet("По дням")
-    rows = db.conn.execute(
-        "SELECT ts, status FROM log").fetchall()
     days = {}
-    for r in rows:
+    for r in log:
         d = datetime.fromtimestamp(r["ts"], TZ).date()
         ok, err = days.get(d, (0, 0))
         days[d] = (ok + (r["status"] == "ok"), err + (r["status"] != "ok"))
-    _sheet(ws, ["Дата", "Успешно", "Ошибки"],
-           [[d, *v] for d, v in sorted(days.items(), reverse=True)])
+    _sheet(ws, ["Дата", "Успешно", "Ошибки"], [[d, *v] for d, v in sorted(days.items(), reverse=True)])
 
     buf = io.BytesIO()
     wb.save(buf)
